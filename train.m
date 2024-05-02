@@ -1,0 +1,216 @@
+% AUDIO PROCESSING
+
+% Path to the dataset directory
+datasetPath = 'audio';
+
+% Categories or instrument labels
+categories = {'violin', 'guitar', 'flute', 'trumpet', 'bassoon', 'saxophone'};
+
+% Create an audioDatastore to manage the data
+ads = audioDatastore(datasetPath, 'IncludeSubfolders', true, 'LabelSource', 'foldernames', 'FileExtensions', '.mp3');
+
+%ads.ReadFcn = @customReadFcn;
+
+% Read and extract features
+%{
+features = [];
+labels = [];
+reset(ads);
+while hasdata(ads)
+    [audio, fs, label] = read(ads);
+    
+
+    %audio = mean(audio, 2); % Convert to mono if stereo
+    currentFeatures = extractFeatures(audio, fs);
+    features = [features; currentFeatures];
+    labels = [labels; label];
+end
+
+% Prepare data for training
+data = array2table(features);
+data.label = labels;
+
+%}
+
+% TRAINING PORTION
+
+[adsTrain, adsTest] = splitEachLabel(ads, 0.8); %split dataset between training and testing
+
+trainDatastoreCount = countEachLabel(adsTrain);
+testDatastoreCount = countEachLabel(adsTest);
+
+
+% Partition the data into training and validation sets
+%cv = cvpartition(data.label, 'HoldOut', 0.2);
+%trainData = data(training(cv), :);
+%testData = data(test(cv), :);
+
+reset(adsTrain) %resets internal iterator
+reset(adsTest)
+
+[audio,dsInfo] = read(adsTrain);
+
+fs = dsInfo.SampleRate;
+
+windowLength = round(0.03*fs);
+overlapLength = round(0.025*fs);
+
+
+%[S,~,~] = mfcc(audio, fs, 'WindowLength', windowLength, 'OverlapLength', overlapLength, 'NumCoeffs', coeffCount);
+afe = audioFeatureExtractor(SampleRate=fs, ...
+    Window=hamming(windowLength,"periodic"),OverlapLength=overlapLength, ...
+    zerocrossrate=true,shortTimeEnergy=true,mfcc=true);
+
+featureMap = info(afe);
+
+features = [];
+labels = [];
+energyThreshold = 0.005;
+zcrThreshold = 0.2;
+
+keepLen = round(length(audio)/3);
+
+reset(adsTrain)
+reset(adsTest)
+
+i = 1;
+while hasdata(adsTrain)
+    disp(adsTrain.Files{i});
+    [audioIn,dsInfo] = read(adsTrain);
+    i= i + 1;
+    fprintf('Fraction of files read: %.2f\n',progress(adsTrain))
+    % Take the first portion of each recording to speed up code
+    audioIn = audioIn(1:keepLen);
+
+    feat = extract(afe,audioIn); % Features extracted
+    isSpeech = feat(:,featureMap.shortTimeEnergy) > energyThreshold;
+    isVoiced = feat(:,featureMap.zerocrossrate) < zcrThreshold;
+
+    voicedSpeech = isSpeech & isVoiced;
+
+    feat(~voicedSpeech,:) = [];
+    feat(:,[featureMap.zerocrossrate,featureMap.shortTimeEnergy]) = [];
+    label = repelem(dsInfo.Label,size(feat,1));
+    
+    features = [features;feat];
+    labels = [labels,label];
+end
+
+%normalize - not needed because pitch is not an extracted feature
+%M = mean(features,1);
+%S = std(features,[],1);
+%features = (features-M)./S;
+
+% Train the SVM model
+%svmModel = fitcecoc(trainData, 'label');
+
+trainedClassifier = fitcknn(features,labels, ...
+    Distance="euclidean", ...
+    NumNeighbors=5, ... %change number of neighbors
+    DistanceWeight="squaredinverse", ...
+    Standardize=false, ...
+    ClassNames=unique(labels));
+
+k = 5;
+group = labels;
+c = cvpartition(group,KFold=k); % 5-fold stratified cross validation
+partitionedModel = crossval(trainedClassifier,CVPartition=c);
+
+validationAccuracy = 1 - kfoldLoss(partitionedModel,LossFun="ClassifError");
+fprintf('\nValidation accuracy = %.2f%%\n', validationAccuracy*100);
+
+validationPredictions = kfoldPredict(partitionedModel);
+figure(Units="normalized",Position=[0.4 0.4 0.4 0.4])
+confusionchart(labels,validationPredictions,title="Validation Accuracy", ...
+    ColumnSummary="column-normalized",RowSummary="row-normalized");
+
+% Predict using the SVM model
+%predictedLabels = predict(svmModel, testData);
+
+% Calculate the accuracy
+%accuracy = sum(predictedLabels == testData.label) / size(testData, 1);
+%fprintf('Test Accuracy: %.2f%%\n', accuracy * 100);
+
+% TESTING PORTION
+featuresTest = [];
+labelsTest = [];
+numVectorsPerFile = [];
+i = 1;
+while hasdata(adsTest)
+    disp(adsTest.Files{i});
+    [audioIn,dsInfo] = read(adsTest);
+    i = i + 1;
+    fprintf('Fraction of files read: %.2f\n',progress(adsTest))
+    % Take the same first portion of each recording to speed up code
+    audioIn = audioIn(1:keepLen);
+
+    feat = extract(afe,audioIn);
+
+    isSpeech = feat(:,featureMap.shortTimeEnergy) > energyThreshold;
+    isVoiced = feat(:,featureMap.zerocrossrate) < zcrThreshold;
+
+    voicedSpeech = isSpeech & isVoiced;
+
+    feat(~voicedSpeech,:) = [];
+    numVec = size(feat,1);
+    feat(:,[featureMap.zerocrossrate,featureMap.shortTimeEnergy]) = [];
+    
+    label = repelem(dsInfo.Label,numVec);
+    
+    numVectorsPerFile = [numVectorsPerFile,numVec];
+    featuresTest = [featuresTest;feat];
+    labelsTest = [labelsTest,label];
+end
+%featuresTest = (featuresTest-M)./S;
+prediction = predict(trainedClassifier,featuresTest);
+prediction = categorical(string(prediction));
+
+figure(Units="normalized",Position=[0.4 0.4 0.4 0.4])
+confusionchart(labelsTest(:),prediction,title="Test Accuracy (Per Frame)", ...
+    ColumnSummary="column-normalized",RowSummary="row-normalized");
+
+r2 = prediction(1:numel(adsTest.Files));
+idx = 1;
+for ii = 1:numel(adsTest.Files)
+    r2(ii) = mode(prediction(idx:idx+numVectorsPerFile(ii)-1));
+    idx = idx + numVectorsPerFile(ii);
+end
+
+figure(Units="normalized",Position=[0.4 0.4 0.4 0.4])
+confusionchart(adsTest.Labels,r2,title="Test Accuracy (Per File)", ...
+    ColumnSummary="column-normalized",RowSummary="row-normalized");
+
+
+
+
+
+
+%{
+% Function to read audio and extract label from filename
+function [audio, fs, label] = customReadFcn(filename)
+    [audio, fs] = audioread(filename);
+    [~, name, ~] = fileparts(filename);
+    label = categorical(extractBefore(name, '_'));  % Extract label and convert to categorical;
+end
+
+% Define feature extraction function
+function features = extractFeatures(audio, fs)
+    % Extract MFCC
+    coeffCount = 13; % Number of MFCC coefficients
+    segmentCount = 10; % Fixed number of temporal segments
+
+    windowLength = round(fs * 0.03); % 30 ms window
+    overlapLength = round(windowLength * 0.75);
+    [S,~,~] = mfcc(audio, fs, 'WindowLength', windowLength, 'OverlapLength', overlapLength, 'NumCoeffs', coeffCount);
+
+    % Ensuring fixed number of segments
+    totalFrames = size(S,1);
+    segmentLength = floor(totalFrames / segmentCount);
+    S = S(1:segmentLength * segmentCount, :); % Truncate to nearest whole segment
+    S = reshape(S, segmentLength, segmentCount, coeffCount);
+    S = mean(S, 1); % Mean over each segment
+    features = reshape(S, 1, []); % Flatten to 1D
+end
+%}
+
+
